@@ -1983,7 +1983,7 @@ class MDF:
             "subject_field",
         )
 
-        fmt = typing.cast(Literal["asc", "csv", "hdf5", "mat", "parquet"], fmt.lower())
+        fmt = typing.cast(Literal["asc", "csv", "hdf5", "mat", "parquet", "zarr"], fmt.lower())
 
         if filename is None:
             message = "Must specify filename for export if MDF was created without a file name"
