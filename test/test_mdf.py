@@ -897,6 +897,17 @@ class TestMDF(unittest.TestCase):
             msg="wildcard match case-insensitive",
         )
 
+    def test_export_to_zarr(self) -> None:        
+        for input_file in Path(TestMDF.tempdir_general.name).iterdir():
+            for compression in (0, 1, 2):
+                mdf = MDF(input_file)
+
+                # outfile0 = cut.save(Path(TestMDF.tempdir.name) / "tmp0", overwrite=True)
+                filename = Path(TestMDF.tempdir.name) / "tmp0"
+    
+                mdf.export("zarr", filename)
+        
+        
 
 if __name__ == "__main__":
     unittest.main()
