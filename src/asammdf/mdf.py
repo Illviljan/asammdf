@@ -1840,7 +1840,7 @@ class MDF:
 
     def export(
         self,
-        fmt: Literal["asc", "csv", "hdf5", "mat", "parquet"],
+        fmt: Literal["asc", "csv", "hdf5", "mat", "parquet", "zarr"],
         filename: StrPath | None = None,
         progress: Any | None = None,
         **kwargs: Unpack[_ExportKwargs],
@@ -2041,7 +2041,12 @@ class MDF:
                 except ImportError:
                     logger.warning("scipy not found; export to mat v4 and v5 is unavailable")
                     return None
-
+        elif fmt == "zarr":
+            try:
+                import zarr
+            except ImportError:
+                logger.warning("zarr not found; export to zarr is unavailable")
+                return None
         elif fmt not in ("csv", "asc"):
             raise MdfException(f"Export to {fmt} is not implemented")
 
@@ -2731,6 +2736,203 @@ class MDF:
                 write_parquet(table, filename, compression=compression)  # type: ignore[arg-type]
             else:
                 write_parquet(table, filename)
+
+        elif fmt == "zarr":
+            filename = filename.with_suffix(".zarr")
+
+            if single_time_base:
+
+                # Create nested groups and add arrays
+                group = zarr.group(filename, overwrite=True)
+                # group = root.create_group(name=str(filename))
+
+                if self.version in MDF2_VERSIONS + MDF3_VERSIONS:
+                    for item in header_items:
+                        group.attrs[item] = getattr(self.header, item).replace(
+                            b"\0", b""
+                        )
+
+                # save each data group in a HDF5 group called
+                # "DataGroup_<cntr>" with the index starting from 1
+                # each HDF5 group will have a string attribute "master"
+                # that will hold the name of the master channel
+
+                count = len(df.columns)
+
+                if progress is not None:
+                    if callable(progress):
+                        progress(0, count * 2)
+                    else:
+                        progress.signals.setValue.emit(0)
+                        progress.signals.setMaximum.emit(count * 2)
+
+                        if progress.stop:
+                            raise Terminated
+
+                samples: NDArray[Any] | pd.Series[Any]
+                for i, channel in enumerate(df):
+                    samples = df[channel]
+                    unit = units.get(channel, "")
+                    comment = comments.get(channel, "")
+
+                    if samples.dtype.kind == "O":
+                        if isinstance(samples[0], np.ndarray):
+                            samples = np.vstack(list(samples))
+                        else:
+                            continue
+
+                    if compression:
+                        dataset = group.create_array(
+                            name=channel, data=samples, compressors=compression
+                        )
+
+                    else:
+                        dataset = group.create_array(name=channel, data=samples)
+                    unit = unit.replace("\0", "")
+                    if unit:
+                        dataset.attrs["unit"] = unit
+                    comment = comment.replace("\0", "")
+                    if comment:
+                        dataset.attrs["comment"] = comment
+
+                    if progress is not None:
+                        if callable(progress):
+                            progress(i + 1, count * 2)
+                        else:
+                            progress.signals.setValue.emit(i + 1)
+
+                            if progress.stop:
+                                raise Terminated
+            else:
+                # header information
+                root = zarr.group(str(filename), overwrite=True)
+
+                if self.version in MDF2_VERSIONS + MDF3_VERSIONS:
+                    for item in header_items:
+                        root.attrs[item] = getattr(self.header, item).replace(
+                            b"\0", b""
+                        )
+
+                # save each data group in a HDF5 group called
+                # "DataGroup_<cntr>" with the index starting from 1
+                # each HDF5 group will have a string attribute "master"
+                # that will hold the name of the master channel
+
+                groups_nr = len(self.virtual_groups)
+
+                if progress is not None:
+                    if callable(progress):
+                        progress(0, groups_nr)
+                    else:
+                        progress.signals.setValue.emit(0)
+                        progress.signals.setMaximum.emit(groups_nr)
+
+                        if progress.stop:
+                            raise Terminated
+
+                for i, (group_index, virtual_group) in enumerate(
+                    self.virtual_groups.items()
+                ):
+                    included_channels = self.included_channels(group_index)[group_index]
+
+                    if not included_channels:
+                        continue
+
+                    unique_names = UniqueDB()
+                    if progress is not None and progress.stop:
+                        raise Terminated
+
+                    if len(virtual_group.groups) == 1:
+                        comment = self.groups[
+                            virtual_group.groups[0]
+                        ].channel_group.comment
+                    else:
+                        comment = "Virtual group i"
+
+                    group_name = f"ChannelGroup_{i}"  # r"/" +
+                    group = root.create_group(name=group_name)
+
+                    group.attrs["comment"] = comment
+
+                    master_index = self.masters_db.get(group_index, -1)
+
+                    if master_index >= 0:
+                        group.attrs["master"] = (
+                            self.groups[group_index].channels[master_index].name
+                        )
+                        master = self._mdf.get(group.attrs["master"], group_index)
+                        if reduce_memory_usage:
+                            master.timestamps = downcast(master.timestamps)
+                        if compression:
+                            dataset = group.create_array(
+                                group.attrs["master"],
+                                data=master.timestamps,
+                                compressors=compression,
+                            )
+                        else:
+                            dataset = group.create_array(
+                                group.attrs["master"],
+                                data=master.timestamps,
+                                # dtype=master.timestamps.dtype,
+                            )
+                        unit = master.unit.replace("\0", "")
+                        if unit:
+                            dataset.attrs["unit"] = unit
+                        comment = master.comment.replace("\0", "")
+                        if comment:
+                            dataset.attrs["comment"] = comment
+
+                    channels = [
+                        (None, gp_index, ch_index)
+                        for gp_index, channel_indexes in included_channels.items()
+                        for ch_index in channel_indexes
+                    ]
+
+                    if not channels:
+                        continue
+
+                    signals = self.select(channels, raw=raw)
+
+                    for j, sig in enumerate(signals):
+                        if use_display_names:
+                            name = (
+                                list(sig.display_names)[0]
+                                if sig.display_names
+                                else sig.name
+                            )
+                        else:
+                            name = sig.name
+                        name = name.replace("\\", "_").replace("/", "_")
+                        name = unique_names.get_unique_name(name)
+                        if reduce_memory_usage:
+                            sig.samples = downcast(sig.samples)
+                        if compression:
+                            dataset = group.create_array(
+                                name,
+                                data=sig.samples,
+                                compressors=compression,
+                            )
+                        else:
+                            dataset = group.create_array(
+                                name,
+                                data=sig.samples,
+                                # dtype=sig.samples.dtype,
+                            )
+                        unit = sig.unit.replace("\0", "")
+                        if unit:
+                            dataset.attrs["unit"] = unit
+                        comment = sig.comment.replace("\0", "")
+                        if comment:
+                            dataset.attrs["comment"] = comment
+
+                    if progress is not None:
+                        if callable(progress):
+                            progress(i + 1, groups_nr)
+                        else:
+                            progress.signals.setValue.emit(i + 1)
+
+                            if progress.stop:
+                                raise Terminated
 
         else:
             message = 'Unsupported export type "{}". Please select "csv", "excel", "hdf5", "mat" or "pandas"'
